@@ -1,0 +1,266 @@
+# Импорт библиотек
+from jinja2.compiler import F
+
+import torch
+import os
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import torch.optim as optim
+from torchvision import transforms
+
+from PIL import Image
+from sklearn.metrics import f1_score
+from torch import nn
+from torch.utils.data import DataLoader, Dataset, random_split
+from tqdm.notebook import tqdm
+
+
+class HumanPoseDataset(Dataset):
+    def __init__(self, csv_file, img_dir, transform=None):
+        self.data = pd.read_csv(csv_file)
+        self.img_dir = img_dir
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        # Формируем имя файла изображения
+        img_name = os.path.join(self.img_dir, str(self.data.iloc[idx, 0])) + '.jpg'
+        image = Image.open(img_name).convert("RGB")
+        label = int(self.data.iloc[idx, 1])
+
+        if self.transform:
+            image = self.transform(image)
+
+        return image, label
+
+
+# Пути к данным
+data_dir = "/content/Dataset/human_poses_data"
+train_img_dir = os.path.join(data_dir, "img_train")
+test_img_dir = os.path.join(data_dir, "img_test")
+train_csv = os.path.join(data_dir, "train_answers.csv")
+categories_csv = os.path.join(data_dir, "activity_categories.csv")
+
+# Загрузка категорий
+categories = pd.read_csv(categories_csv)
+class_names = {row['id']: row['category'] for _, row in categories.iterrows()}
+
+# Определение трансформаций
+transform = transforms.Compose([
+    transforms.Resize((128, 128)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+full_dataset = HumanPoseDataset(csv_file=train_csv, img_dir=train_img_dir, transform=transform)
+
+train_size = int(0.8 * len(full_dataset))
+valid_size = len(full_dataset) - train_size
+train_dataset, valid_dataset = random_split(full_dataset, [train_size, valid_size])
+
+train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+valid_dataloader = DataLoader(valid_dataset, batch_size=32, shuffle=False)
+
+
+class SkipConnectionBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(SkipConnectionBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.skip_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        identity = self.skip_conv(x)
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += identity
+        return F.relu(out)
+
+
+class MyModel(nn.Module):
+    def __init__(self, num_classes: int):
+        super(MyModel, self).__init__()
+        self.model = nn.Sequential(
+            SkipConnectionBlock(3, 128),
+            nn.MaxPool2d(2, 2),
+
+            SkipConnectionBlock(128, 128),
+            nn.MaxPool2d(2, 2),
+
+            SkipConnectionBlock(128, 128),
+            nn.MaxPool2d(2, 2),
+
+            nn.Flatten(),
+            nn.Linear(128 * 16 * 16, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, batch):
+        inputs, _ = batch
+        return self.model(inputs)
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f'Используемое устройство: {device}')
+
+num_classes = len(class_names)
+model = MyModel(num_classes=num_classes).to(device)
+print(model)
+
+# Вывод сводки модели (опционально, требует установки torchsummary) from torchsummary import summary summary(model, (3, 128, 128))
+
+# Определение оптимизатора и функции потерь
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+criterion = nn.CrossEntropyLoss()
+
+
+# Переменные для визуализации метрик и функции потерь
+train_losses = []
+val_losses = []
+train_f1_scores = []
+val_f1_scores = []
+
+best_val_f1 = 0.0
+best_model_path = 'best_model.pth'
+
+# Количество эпох
+num_epochs = 10
+
+for epoch in range(num_epochs):
+    model.train()
+    running_loss = 0.0
+    train_true = []
+    train_pred = []
+
+    print(f'\nЭпоха {epoch+1}/{num_epochs}')
+    print('-' * 20)
+
+    for batch in tqdm(train_dataloader, desc='Тренировка'):
+        inputs, labels = batch
+        inputs, labels = inputs.to(device), labels.to(device)
+
+        optimizer.zero_grad()
+
+        outputs = model(batch)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+
+        preds = torch.argmax(outputs, dim=1)
+        train_true.extend(labels.cpu().numpy())
+        train_pred.extend(preds.cpu().numpy())
+
+    train_f1 = f1_score(train_true, train_pred, average='macro')
+    train_losses.append(running_loss / len(train_dataloader))
+    train_f1_scores.append(train_f1)
+
+    model.eval()
+    val_running_loss = 0.0
+    val_true = []
+    val_pred = []
+
+    with torch.no_grad():
+        for batch in tqdm(valid_dataloader, desc='Валидация'):
+            inputs, labels = batch
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            outputs = model(batch)
+            loss = criterion(outputs, labels)
+
+            val_running_loss += loss.item()
+
+            preds = torch.argmax(outputs, dim=1)
+            val_true.extend(labels.cpu().numpy())
+            val_pred.extend(preds.cpu().numpy())
+
+    val_f1 = f1_score(val_true, val_pred, average='macro')
+    val_losses.append(val_running_loss / len(valid_dataloader))
+    val_f1_scores.append(val_f1)
+
+    if val_f1 > best_val_f1:
+        best_val_f1 = val_f1
+        torch.save(model.state_dict(), best_model_path)
+        print(f'Новая лучшая модель сохранена с F1: {best_val_f1:.4f}')
+
+    print(f'Epoch [{epoch+1}/{num_epochs}], '
+          f'Train Loss: {train_losses[-1]:.4f}, Train F1: {train_f1:.4f}, '
+          f'Val Loss: {val_losses[-1]:.4f}, Val F1: {val_f1:.4f}')
+
+plt.figure(figsize=(14, 5))
+
+# График потерь
+plt.subplot(1, 2, 1)
+plt.plot(train_losses, label='Тренировочная потеря')
+plt.plot(val_losses, label='Валидационная потеря')
+plt.title('Потери')
+plt.xlabel('Эпоха')
+plt.ylabel('Потеря')
+plt.legend()
+
+# График F1 Score
+plt.subplot(1, 2, 2)
+plt.plot(train_f1_scores, label='Тренировочный F1')
+plt.plot(val_f1_scores, label='Валидационный F1')
+plt.title('F1 Score')
+plt.xlabel('Эпоха')
+plt.ylabel('F1 Score')
+plt.legend()
+
+plt.show()
+
+
+class InferenceDataset(Dataset):
+    def __init__(self, img_names, img_dir, transform=None):
+        self.img_names = img_names
+        self.img_dir = img_dir
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.img_names)
+
+    def __getitem__(self, idx):
+        img_name = os.path.join(self.img_dir, self.img_names[idx])
+        id = int(self.img_names[idx][:-4])
+        image = Image.open(img_name).convert("RGB")
+
+        if self.transform:
+            image = self.transform(image)
+
+        return id, image
+
+
+test_img_names = os.listdir(test_img_dir)
+test_img_names = [name for name in test_img_names if name.endswith('.jpg')]
+
+infer_dataset = InferenceDataset(test_img_names, test_img_dir, transform=transform)
+infer_dataloader = DataLoader(infer_dataset, batch_size=64, shuffle=False)
+
+model = MyModel(num_classes=num_classes).to(device)
+model.load_state_dict(torch.load(best_model_path))
+model.eval()
+
+results = []
+for ids, images in tqdm(infer_dataloader, desc='Инференс'):
+    images = images.to(device)
+
+    with torch.no_grad():
+        outputs = model((images, None))
+        preds = torch.argmax(outputs, dim=1).cpu().numpy()
+
+    for id, pred_class in zip(ids, preds):
+        results.append({"id": int(id), "target_feature": pred_class})
+
+df_results = pd.DataFrame(results)
+print(df_results.head())
+
+# Сохранение результатов
+df_results.to_csv("submission.csv", index=False)
+print("Файл submission.csv сохранен.")
